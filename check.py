@@ -25,11 +25,20 @@ TOPIC = os.environ["NTFY_TOPIC"]
 BOOKING_ID = re.compile(r'"bookingBusinessId"\s*:\s*"(\d+)"')
 
 
+def quiet_now():
+    """수면 시간(한국시간 00:00 ~ 06:30)이면 True."""
+    t = datetime.now(KST)
+    return (t.hour, t.minute) < (6, 30)
+
+
 def notify(title, message, click=None, urgent=False):
     body = {"topic": TOPIC, "title": title, "message": message[:3000]}
     if click:
         body["click"] = click
-    if urgent:
+    if quiet_now():
+        # 수면 시간에는 소리와 진동 없이 조용히 알림 목록에만 쌓아요.
+        body["priority"] = 2
+    elif urgent:
         body["priority"] = 5
         body["tags"] = ["rotating_light"]
     req = urllib.request.Request(
@@ -201,41 +210,56 @@ def main():
         )
     else:
         was_open = prev.get("open", False)
-        if is_open and not was_open:
+        reopened = is_open and not was_open
+        suffix = "" if is_open else " (예약창은 아직 닫힘)"
+        tail = (
+            "\n지금 바로 예약 화면으로 들어가세요"
+            if is_open
+            else "\n예약창이 열리면 따로 알려드릴게요"
+        )
+
+        new_open = sorted(set(open_list) - set(prev.get("open_dates", [])))
+        new_avail = sorted(set(avail) - set(prev.get("avail_dates", [])))
+
+        if reopened:
             if avail:
-                body = "\n".join(avail_lines(avail, sorted(avail))) + "\n지금 바로 예약 화면으로 들어가세요"
+                body = (
+                    "\n".join(avail_lines(avail, sorted(avail)))
+                    + "\n지금 바로 예약 화면으로 들어가세요"
+                )
             else:
                 body = "아직 빈 날짜는 안 보여요. 예약 화면에서 확인해 보세요"
             notify(f"{NAME} 예약창이 열렸어요!", body, CLICK, urgent=True)
-        elif is_open:
-            new_open = sorted(set(open_list) - set(prev.get("open_dates", [])))
-            if new_open:
-                shown = ", ".join(fmt_date(d) for d in new_open[:8])
-                more = f" 외 {len(new_open) - 8}일" if len(new_open) > 8 else ""
-                notify(
-                    f"{NAME} 새 예약일 오픈!",
-                    f"열린 날짜: {shown}{more}",
-                    CLICK,
-                    urgent=True,
-                )
 
-            new_avail = sorted(set(avail) - set(prev.get("avail_dates", [])))
-            if new_avail:
-                notify(
-                    f"{NAME} 예약 가능 자리 생김!",
-                    "\n".join(avail_lines(avail, new_avail))
-                    + "\n지금 바로 예약 화면으로 들어가세요",
-                    CLICK,
-                    urgent=True,
-                )
-            elif flag and not prev.get("has_slot"):
-                notify(
-                    f"{NAME} 예약 가능 자리 생김! (신호 감지)",
-                    "지금 바로 예약 화면에서 확인해 보세요",
-                    CLICK,
-                    urgent=True,
-                )
-        # 예약창이 닫혀 있는 동안에는 자리 데이터가 있어도 알리지 않아요.
+        if new_open:
+            shown = ", ".join(fmt_date(d) for d in new_open[:8])
+            more = f" 외 {len(new_open) - 8}일" if len(new_open) > 8 else ""
+            notify(
+                f"{NAME} 새 예약일 오픈!{suffix}",
+                f"열린 날짜: {shown}{more}",
+                CLICK,
+                urgent=True,
+            )
+
+        if new_avail and not reopened:
+            title = (
+                f"{NAME} 예약 가능 자리 생김!"
+                if is_open
+                else f"{NAME} 빈자리 발생!{suffix}"
+            )
+            notify(
+                title,
+                "\n".join(avail_lines(avail, new_avail)) + tail,
+                CLICK,
+                urgent=True,
+            )
+        elif flag and not prev.get("has_slot") and not reopened:
+            notify(
+                f"{NAME} 예약 가능 자리 생김! (신호 감지){suffix}",
+                "예약 화면에서 확인해 보세요",
+                CLICK,
+                urgent=True,
+            )
 
     state[NAME] = {
         "open": bool(is_open),
