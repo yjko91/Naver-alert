@@ -1,1 +1,1 @@
-{"대추밭백한의원": {"status": "ok", "has_booking": true}, "지금부터핏 오류동(테스트)": {"status": "ok", "has_booking": true}, "대추밭백한의원|예약가능": {"status": "ok", "available": false}, "지금부터핏 오류동(테스트)|예약가능": {"status": "ok", "available": false}}
+{"대추밭백한의원": {"status": "ok", "has_booking": false}, "지금부터핏 오류동(테스트)": {"status": "ok", "has_booking": true}, "대추밭백한의원|예약가능": {"status": "ok", "available": false}, "지금부터핏 오류동(테스트)|예약가능": {"status": "ok", "available": false}}
