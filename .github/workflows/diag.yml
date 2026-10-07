@@ -1,0 +1,36 @@
+
+
+
+
+name: diag
+
+on:
+
+  workflow_dispatch:
+
+
+
+jobs:
+
+  diag:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - name: Run diagnostic
+
+        run: python diag.py
+
+        env:
+
+          NTFY_TOPIC: ${{
+secrets.NTFY_TOPIC }}
+
+ 
+
+
+
+
