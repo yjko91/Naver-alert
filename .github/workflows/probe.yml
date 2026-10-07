@@ -1,0 +1,14 @@
+name: probe
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run probe
+        run: python probe.py
+        env:
+
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
