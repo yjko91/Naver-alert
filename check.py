@@ -1,36 +1,29 @@
 import json
 import os
-import re
 import urllib.error
 import urllib.request
+from datetime import date, datetime, timedelta, timezone
 
-# 1) 예약 버튼 감시: 이름 -> 네이버 플레이스 주소
-PLACES = {
-    "대추밭백한의원": "https://m.place.naver.com/hospital/13258169/home",
-    "지금부터핏 오류동(테스트)": "https://m.place.naver.com/place/1813888829/home",
-}
-# 2) 예약 가능 자리 감시: 이름 -> (네이버 예약 가게 번호, 알림을 누르면 열 주소)
-BOOKINGS = {
-    "대추밭백한의원": (
-        "1359557",
-        "https://m.booking.naver.com/booking/13/bizes/1359557",
-    ),
-    "지금부터핏 오류동(테스트)": (
-        "981741",
-        "https://m.place.naver.com/place/1813888829/home",
-    ),
-}
+# 감시 대상 (대추밭백한의원 네이버 예약)
+NAME = "대추밭백한의원"
+BIZ = "1359557"
+ITEM = "6566444"
+CLICK = "https://m.booking.naver.com/booking/13/bizes/1359557"
+
+API = "https://api.booking.naver.com/v3.0/businesses"
+DAYS_AHEAD = 365  # 오늘부터 1년 뒤까지 모든 달을 확인
 STATE_FILE = "state.json"
+KST = timezone(timedelta(hours=9))
+WEEK = "월화수목금토일"
 UA = (
     "Mozilla/5.0 (Linux; Android 13; SM-S918N) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
 )
 TOPIC = os.environ["NTFY_TOPIC"]
-BOOKING_ID = re.compile(r'"bookingBusinessId"\s*:\s*"(\d+)"')
 
 
 def notify(title, message, click=None, urgent=False):
-    body = {"topic": TOPIC, "title": title, "message": message}
+    body = {"topic": TOPIC, "title": title, "message": message[:3000]}
     if click:
         body["click"] = click
     if urgent:
@@ -57,18 +50,96 @@ def fetch(url):
         return 0, ""
 
 
-def has_booking(html):
-    return BOOKING_ID.search(html) is not None
-
-
-def slot_available(text):
+def get_json(url):
+    status, text = fetch(url)
+    if status != 200:
+        return None
     try:
-        items = json.loads(text)
+        return json.loads(text)
     except ValueError:
         return None
+
+
+def chunks(start, end, size=31):
+    cur = start
+    while cur <= end:
+        last = min(cur + timedelta(days=size - 1), end)
+        yield cur, last
+        cur = last + timedelta(days=1)
+
+
+def range_url(kind, a, b):
+    return (
+        f"{API}/{BIZ}/biz-items/{ITEM}/{kind}"
+        f"?startDateTime={a.isoformat()}T00:00:00"
+        f"&endDateTime={b.isoformat()}T23:59:59&lang=ko"
+    )
+
+
+def fetch_open_dates(today):
+    """예약이 열려 있는(영업일) 날짜들. 휴무일과 아직 안 열린 날은 제외."""
+    found = set()
+    for a, b in chunks(today, today + timedelta(days=DAYS_AHEAD)):
+        data = get_json(range_url("daily-schedules", a, b))
+        if not isinstance(data, dict):
+            return None
+        for d, v in data.items():
+            if (
+                isinstance(v, dict)
+                and v.get("isBusinessDay") is True
+                and not v.get("isHoliday")
+            ):
+                found.add(d)
+    return found
+
+
+def fetch_available(open_dates, now):
+    """열린 날짜의 시간대 중 지금 예약 가능한 칸 {날짜: [시각들]}."""
+    groups = []
+    for d in sorted(open_dates):
+        dd = date.fromisoformat(d)
+        if groups and (dd - groups[-1][0]).days <= 30:
+            groups[-1][1] = dd
+        else:
+            groups.append([dd, dd])
+
+    avail = {}
+    total = 0
+    sample = None
+    for a, b in groups:
+        slots = get_json(range_url("hourly-schedules", a, b))
+        if not isinstance(slots, list):
+            return None
+        for s in slots:
+            if not isinstance(s, dict):
+                continue
+            if not (s.get("isUnitBusinessDay") and s.get("isUnitSaleDay")):
+                continue
+            try:
+                dt = datetime.fromisoformat(s.get("unitStartDateTime"))
+            except (TypeError, ValueError):
+                continue
+            total += 1
+            stock, booked = s.get("unitStock"), s.get("unitBookingCount")
+            if sample is None:
+                sample = f"{dt:%m/%d %H:%M} 정원 {stock} / 예약 {booked}"
+            if dt <= now:
+                continue
+            if isinstance(stock, int) and isinstance(booked, int) and stock > booked:
+                avail.setdefault(dt.strftime("%Y-%m-%d"), []).append(dt.strftime("%H:%M"))
+    return avail, total, sample
+
+
+def has_slot_flag():
+    items = get_json(f"{API}/{BIZ}/biz-items")
     if not isinstance(items, list):
         return None
     return any(isinstance(i, dict) and i.get("hasSlot") is True for i in items)
+
+
+def fmt_date(d):
+    dd = date.fromisoformat(d)
+    return f"{dd.month}/{dd.day}({WEEK[dd.weekday()]})"
 
 
 def main():
@@ -76,65 +147,76 @@ def main():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, encoding="utf-8") as f:
             state = json.load(f)
+    prev = state.get(NAME)
 
-    new_state = {}
+    now = datetime.now(KST)
+    today = now.date()
 
-    # 예약 버튼 감시
-    for name, url in PLACES.items():
-        status, html = fetch(url)
-        prev = state.get(name)
+    open_dates = fetch_open_dates(today)
+    result = fetch_available(open_dates, now) if open_dates is not None else None
 
-        if status != 200:
-            new_state[name] = {"status": "error"}
-            if not prev or prev.get("status") != "error":
-                notify(f"{name} 확인 실패", f"페이지를 읽지 못했어요 (HTTP {status})")
-            continue
+    if result is None:
+        if not prev or not prev.get("error"):
+            notify(f"{NAME} 확인 실패", "예약 정보를 읽지 못했어요")
+        keep = dict(prev or {})
+        keep["error"] = True
+        state[NAME] = keep
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False)
+        return
 
-        now = has_booking(html)
-        new_state[name] = {"status": "ok", "has_booking": now}
+    avail, total, sample = result
+    flag = has_slot_flag()
+    open_list = sorted(open_dates)
 
-        if prev is None or "has_booking" not in prev:
-            notify(
-                f"{name} 감시 시작",
-                "지금 예약 버튼: " + ("있음" if now else "없음"),
-                url,
-            )
-        elif prev.get("status") == "ok" and not prev["has_booking"] and now:
-            notify(f"{name} 예약 버튼 생김!", "지금 확인해 보세요", url, urgent=True)
-
-    # 예약 가능 자리 감시
-    for name, (biz, click) in BOOKINGS.items():
-        key = f"{name}|예약가능"
-        prev = state.get(key)
-        status, text = fetch(
-            f"https://api.booking.naver.com/v3.0/businesses/{biz}/biz-items"
+    if prev is None or "open_dates" not in prev:
+        span = f"{open_list[0]} ~ {open_list[-1]}" if open_list else "없음"
+        notify(
+            f"{NAME} 감시 시작",
+            f"열린 날짜 {len(open_list)}일 ({span})\n"
+            f"예약 시간대 {total}칸 중 빈 자리 {sum(len(v) for v in avail.values())}칸\n"
+            f"예시 칸: {sample}\n"
+            f"hasSlot: {flag}",
+            CLICK,
         )
-        avail = slot_available(text) if status == 200 else None
-
-        if avail is None:
-            new_state[key] = {"status": "error"}
-            if not prev or prev.get("status") != "error":
-                notify(f"{name} 예약 가능 확인 실패", f"HTTP {status}")
-            continue
-
-        new_state[key] = {"status": "ok", "available": avail}
-
-        if prev is None or "available" not in prev:
+    else:
+        new_open = sorted(set(open_list) - set(prev.get("open_dates", [])))
+        if new_open:
+            shown = ", ".join(fmt_date(d) for d in new_open[:8])
+            more = f" 외 {len(new_open) - 8}일" if len(new_open) > 8 else ""
             notify(
-                f"{name} 예약 가능 감시 시작",
-                "지금 예약 가능한 자리: " + ("있음" if avail else "없음"),
-                click,
-            )
-        elif prev.get("status") == "ok" and not prev["available"] and avail:
-            notify(
-                f"{name} 예약 가능 자리 생김!",
-                "지금 바로 예약 화면으로 들어가세요",
-                click,
+                f"{NAME} 새 예약일 오픈!",
+                f"열린 날짜: {shown}{more}",
+                CLICK,
                 urgent=True,
             )
 
+        new_avail = sorted(set(avail) - set(prev.get("avail_dates", [])))
+        if new_avail:
+            lines = [
+                f"{fmt_date(d)} " + ", ".join(sorted(avail[d])[:6]) for d in new_avail[:6]
+            ]
+            notify(
+                f"{NAME} 예약 가능 자리 생김!",
+                "\n".join(lines) + "\n지금 바로 예약 화면으로 들어가세요",
+                CLICK,
+                urgent=True,
+            )
+        elif flag and not prev.get("has_slot"):
+            notify(
+                f"{NAME} 예약 가능 자리 생김! (신호 감지)",
+                "지금 바로 예약 화면에서 확인해 보세요",
+                CLICK,
+                urgent=True,
+            )
+
+    state[NAME] = {
+        "open_dates": open_list,
+        "avail_dates": sorted(avail),
+        "has_slot": bool(flag),
+    }
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(new_state, f, ensure_ascii=False)
+        json.dump(state, f, ensure_ascii=False)
 
 
 if __name__ == "__main__":
