@@ -3,25 +3,14 @@ import os
 import urllib.error
 import urllib.request
 
-TARGETS = [
-    ("대추밭백한의원", "1359557", 13),
-    ("지금부터핏", "981741", 13),
-]
+BIZ = "1359557"
+ITEM = "6566444"
 API = "https://api.booking.naver.com/v3.0/businesses"
-START = "2026-10-01T00:00:00"
-END = "2027-01-31T23:59:59"
 UA = (
     "Mozilla/5.0 (Linux; Android 13; SM-S918N) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
 )
 TOPIC = os.environ["NTFY_TOPIC"]
-
-QUERY = (
-    "query schedule($scheduleParams: ScheduleParams) { "
-    "schedule(input: $scheduleParams) { bizItemSchedule { daily { "
-    "date stock bookingCount isBusinessDay isSaleDay isUnitSaleDay "
-    "isUnitBusinessDay } } } }"
-)
 
 
 def notify(title, message):
@@ -37,82 +26,82 @@ def notify(title, message):
         pass
 
 
-def request(url, data=None, headers=None):
-    h = {"User-Agent": UA, "Accept-Language": "ko-KR,ko;q=0.9"}
-    if headers:
-        h.update(headers)
-    req = urllib.request.Request(url, data=data, headers=h)
+def request(url):
+    req = urllib.request.Request(
+        url, headers={"User-Agent": UA, "Accept-Language": "ko-KR,ko;q=0.9"}
+    )
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             return r.status, r.read().decode("utf-8", "ignore")
     except urllib.error.HTTPError as e:
         try:
-            body = e.read().decode("utf-8", "ignore")
+            return e.code, e.read().decode("utf-8", "ignore")
         except Exception:
-            body = ""
-        return e.code, body
+            return e.code, ""
     except Exception as e:
         return 0, str(e)
 
 
+def slim(d):
+    return {k: v for k, v in d.items() if k != "prices"}
+
+
 def main():
-    for label, biz, typ in TARGETS:
-        s, body = request(f"{API}/{biz}/biz-items")
-        try:
-            items = json.loads(body)
-        except ValueError:
-            items = []
-        if not isinstance(items, list):
-            items = []
-        items = [i for i in items if isinstance(i, dict)]
-        lines = [
-            f"{i.get('bizItemId')} | {i.get('name')} | "
-            f"hasSlot={i.get('hasSlot')} | stock={i.get('stock')}"
-            for i in items
-        ]
-        notify(f"탐색 {label} 상품 목록", f"HTTP {s}\n" + "\n".join(lines[:15]))
-        if not items:
-            continue
+    base = f"{API}/{BIZ}/biz-items/{ITEM}"
 
-        item = items[0].get("bizItemId")
-        out = []
-        for name in ("daily-schedules", "hourly-schedules", "schedules"):
-            url = (
-                f"{API}/{biz}/biz-items/{item}/{name}"
-                f"?startDateTime={START}&endDateTime={END}&lang=ko"
-            )
-            s2, b2 = request(url)
-            out.append(f"[{name}] HTTP {s2}\n{b2[:300]}")
+    s, body = request(
+        f"{base}/daily-schedules?startDateTime=2026-10-01T00:00:00"
+        f"&endDateTime=2027-01-31T23:59:59&lang=ko"
+    )
+    try:
+        data = json.loads(body)
+    except ValueError:
+        notify("탐색 일별 실패", f"HTTP {s}\n{body[:500]}")
+        return
+    dates = sorted(data)
 
-        payload = json.dumps(
-            {
-                "operationName": "schedule",
-                "variables": {
-                    "scheduleParams": {
-                        "businessTypeId": typ,
-                        "businessId": biz,
-                        "bizItemId": str(item),
-                        "startDateTime": START,
-                        "endDateTime": END,
-                        "fixedTime": True,
-                    }
-                },
-                "query": QUERY,
-            }
-        ).encode("utf-8")
-        headers = {
-            "Content-Type": "application/json",
-            "Origin": "https://m.booking.naver.com",
-            "Referer": f"https://m.booking.naver.com/booking/{typ}/bizes/{biz}",
-        }
-        for url in (
-            "https://m.booking.naver.com/graphql?opName=schedule",
-            "https://api.booking.naver.com/v3/graphql?opName=schedule",
-        ):
-            s3, b3 = request(url, data=payload, headers=headers)
-            out.append(f"[graphql] HTTP {s3}\n{b3[:300]}")
+    pick = [d for d in dates if "2026-10-07" <= d <= "2026-10-12"]
+    notify(
+        "탐색 A 10/7~10/12 (7수휴무 8마감 9휴무 10마감)",
+        "\n".join(json.dumps(slim(data[d]), ensure_ascii=False) for d in pick),
+    )
 
-        notify(f"탐색 {label} 일정 조회", "\n\n".join(out))
+    pick = [d for d in dates if d in ("2026-11-30", "2026-12-01", "2026-12-02", dates[-1])]
+    notify(
+        "탐색 B 11/30, 12/1(미오픈), 12/2, 마지막날",
+        "\n".join(json.dumps(slim(data[d]), ensure_ascii=False) for d in pick),
+    )
+
+    combos = {}
+    free = []
+    for d in dates:
+        v = data[d]
+        key = (v.get("isBusinessDay"), v.get("isSaleDay"), v.get("isHoliday"))
+        combos[key] = combos.get(key, 0) + 1
+        st, bc = v.get("stock"), v.get("bookingCount")
+        if isinstance(st, int) and isinstance(bc, int) and st > bc:
+            free.append(d)
+    notify(
+        "탐색 C 요약",
+        f"날짜 {len(dates)}개 ({dates[0]}~{dates[-1]})\n"
+        f"(영업일,판매일,휴일) 조합: {combos}\n"
+        f"stock>bookingCount인 날짜 {len(free)}개: {free[:20]}",
+    )
+
+    s2, b2 = request(
+        f"{base}/hourly-schedules?startDateTime=2026-10-08T00:00:00"
+        f"&endDateTime=2026-10-08T23:59:59&lang=ko"
+    )
+    try:
+        slots = json.loads(b2)
+    except ValueError:
+        notify("탐색 D 시간대 실패", f"HTTP {s2}\n{b2[:500]}")
+        return
+    if isinstance(slots, list):
+        txt = "\n".join(json.dumps(x, ensure_ascii=False)[:450] for x in slots[:4])
+        notify("탐색 D 10/8(마감) 시간대", f"HTTP {s2}, 슬롯 {len(slots)}개\n{txt}")
+    else:
+        notify("탐색 D 시간대", f"HTTP {s2}\n{b2[:800]}")
 
 
 if __name__ == "__main__":
