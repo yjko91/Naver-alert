@@ -1,10 +1,14 @@
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 
+# 감시할 가게: 이름 -> 네이버 플레이스 주소
+# (지금부터핏은 예약 버튼이 이미 있는 테스트용이라 지워도 돼요)
 PLACES = {
     "대추밭백한의원": "https://m.place.naver.com/hospital/13258169/home",
+    "지금부터핏 오류동(테스트)": "https://m.place.naver.com/place/1813888829/home",
 }
 STATE_FILE = "state.json"
 UA = (
@@ -12,6 +16,7 @@ UA = (
     "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
 )
 TOPIC = os.environ["NTFY_TOPIC"]
+BOOKING_ID = re.compile(r'"bookingBusinessId"\s*:\s*"(\d+)"')
 
 
 def notify(title, message, click=None):
@@ -39,12 +44,8 @@ def fetch(url):
         return 0, ""
 
 
-def analyze(html):
-    return {
-        "booking_link": "booking.naver.com" in html,
-        "booking_word": "예약" in html,
-        "length": len(html),
-    }
+def has_booking(html):
+    return BOOKING_ID.search(html) is not None
 
 
 def main():
@@ -64,21 +65,16 @@ def main():
                 notify(f"{name} 확인 실패", f"페이지를 읽지 못했어요 (HTTP {status})")
             continue
 
-        info = analyze(html)
-        new_state[name] = {"status": "ok", **info}
+        now = has_booking(html)
+        new_state[name] = {"status": "ok", "has_booking": now}
 
-        if prev is None:
+        if prev is None or "has_booking" not in prev:
             notify(
-                f"{name} 첫 확인",
-                f"페이지 길이 {info['length']}, 예약 링크 {info['booking_link']}, "
-                f"'예약' 단어 {info['booking_word']}",
+                f"{name} 감시 시작",
+                "지금 예약 버튼: " + ("있음" if now else "없음"),
                 url,
             )
-        elif (
-            prev.get("status") == "ok"
-            and not prev.get("booking_link")
-            and info["booking_link"]
-        ):
+        elif prev.get("status") == "ok" and not prev["has_booking"] and now:
             notify(f"{name} 예약 버튼 생김!", "지금 확인해 보세요", url)
 
     with open(STATE_FILE, "w", encoding="utf-8") as f:
