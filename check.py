@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
@@ -8,6 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 NAME = "대추밭백한의원"
 BIZ = "1359557"
 ITEM = "6566444"
+PLACE_URL = "https://m.place.naver.com/hospital/13258169/home"
 CLICK = "https://m.booking.naver.com/booking/13/bizes/1359557"
 
 API = "https://api.booking.naver.com/v3.0/businesses"
@@ -20,6 +22,7 @@ UA = (
     "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
 )
 TOPIC = os.environ["NTFY_TOPIC"]
+BOOKING_ID = re.compile(r'"bookingBusinessId"\s*:\s*"(\d+)"')
 
 
 def notify(title, message, click=None, urgent=False):
@@ -76,8 +79,16 @@ def range_url(kind, a, b):
     )
 
 
+def booking_page_open():
+    """플레이스 페이지에 예약 버튼(예약 번호)이 있으면 예약창이 열린 것."""
+    status, html = fetch(PLACE_URL)
+    if status != 200:
+        return None
+    return BOOKING_ID.search(html) is not None
+
+
 def fetch_open_dates(today):
-    """예약이 열려 있는(영업일) 날짜들. 휴무일과 아직 안 열린 날은 제외."""
+    """예약 일정이 열려 있는(영업일) 날짜들. 휴무일과 아직 안 열린 날은 제외."""
     found = set()
     for a, b in chunks(today, today + timedelta(days=DAYS_AHEAD)):
         data = get_json(range_url("daily-schedules", a, b))
@@ -142,6 +153,15 @@ def fmt_date(d):
     return f"{dd.month}/{dd.day}({WEEK[dd.weekday()]})"
 
 
+def avail_lines(avail, dates, limit=6):
+    return [f"{fmt_date(d)} " + ", ".join(sorted(avail[d])[:6]) for d in dates[:limit]]
+
+
+def save(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False)
+
+
 def main():
     state = {}
     if os.path.exists(STATE_FILE):
@@ -152,17 +172,17 @@ def main():
     now = datetime.now(KST)
     today = now.date()
 
+    is_open = booking_page_open()
     open_dates = fetch_open_dates(today)
     result = fetch_available(open_dates, now) if open_dates is not None else None
 
-    if result is None:
+    if result is None or is_open is None:
         if not prev or not prev.get("error"):
             notify(f"{NAME} 확인 실패", "예약 정보를 읽지 못했어요")
         keep = dict(prev or {})
         keep["error"] = True
         state[NAME] = keep
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False)
+        save(state)
         return
 
     avail, total, sample = result
@@ -173,50 +193,57 @@ def main():
         span = f"{open_list[0]} ~ {open_list[-1]}" if open_list else "없음"
         notify(
             f"{NAME} 감시 시작",
+            f"예약창: {'열림' if is_open else '닫힘'}\n"
             f"열린 날짜 {len(open_list)}일 ({span})\n"
             f"예약 시간대 {total}칸 중 빈 자리 {sum(len(v) for v in avail.values())}칸\n"
-            f"예시 칸: {sample}\n"
-            f"hasSlot: {flag}",
+            f"예시 칸: {sample}",
             CLICK,
         )
     else:
-        new_open = sorted(set(open_list) - set(prev.get("open_dates", [])))
-        if new_open:
-            shown = ", ".join(fmt_date(d) for d in new_open[:8])
-            more = f" 외 {len(new_open) - 8}일" if len(new_open) > 8 else ""
-            notify(
-                f"{NAME} 새 예약일 오픈!",
-                f"열린 날짜: {shown}{more}",
-                CLICK,
-                urgent=True,
-            )
+        was_open = prev.get("open", False)
+        if is_open and not was_open:
+            if avail:
+                body = "\n".join(avail_lines(avail, sorted(avail))) + "\n지금 바로 예약 화면으로 들어가세요"
+            else:
+                body = "아직 빈 날짜는 안 보여요. 예약 화면에서 확인해 보세요"
+            notify(f"{NAME} 예약창이 열렸어요!", body, CLICK, urgent=True)
+        elif is_open:
+            new_open = sorted(set(open_list) - set(prev.get("open_dates", [])))
+            if new_open:
+                shown = ", ".join(fmt_date(d) for d in new_open[:8])
+                more = f" 외 {len(new_open) - 8}일" if len(new_open) > 8 else ""
+                notify(
+                    f"{NAME} 새 예약일 오픈!",
+                    f"열린 날짜: {shown}{more}",
+                    CLICK,
+                    urgent=True,
+                )
 
-        new_avail = sorted(set(avail) - set(prev.get("avail_dates", [])))
-        if new_avail:
-            lines = [
-                f"{fmt_date(d)} " + ", ".join(sorted(avail[d])[:6]) for d in new_avail[:6]
-            ]
-            notify(
-                f"{NAME} 예약 가능 자리 생김!",
-                "\n".join(lines) + "\n지금 바로 예약 화면으로 들어가세요",
-                CLICK,
-                urgent=True,
-            )
-        elif flag and not prev.get("has_slot"):
-            notify(
-                f"{NAME} 예약 가능 자리 생김! (신호 감지)",
-                "지금 바로 예약 화면에서 확인해 보세요",
-                CLICK,
-                urgent=True,
-            )
+            new_avail = sorted(set(avail) - set(prev.get("avail_dates", [])))
+            if new_avail:
+                notify(
+                    f"{NAME} 예약 가능 자리 생김!",
+                    "\n".join(avail_lines(avail, new_avail))
+                    + "\n지금 바로 예약 화면으로 들어가세요",
+                    CLICK,
+                    urgent=True,
+                )
+            elif flag and not prev.get("has_slot"):
+                notify(
+                    f"{NAME} 예약 가능 자리 생김! (신호 감지)",
+                    "지금 바로 예약 화면에서 확인해 보세요",
+                    CLICK,
+                    urgent=True,
+                )
+        # 예약창이 닫혀 있는 동안에는 자리 데이터가 있어도 알리지 않아요.
 
     state[NAME] = {
+        "open": bool(is_open),
         "open_dates": open_list,
         "avail_dates": sorted(avail),
         "has_slot": bool(flag),
     }
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False)
+    save(state)
 
 
 if __name__ == "__main__":
